@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import importlib
-import json
 import logging
 import re
 import uuid
 from dataclasses import asdict
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
+import requests
 from unidecode import unidecode
 
+from .address_normalizer import AddressNormalizer
+from .config import settings
 from .data_models import PropertyRecord
 
 logging.basicConfig(level=logging.INFO)
@@ -27,10 +29,15 @@ else:
 _geopy_spec = importlib.util.find_spec("geopy")
 if _geopy_spec is not None:
     geopy = importlib.import_module("geopy")
-    from geopy.geocoders import Nominatim
+    try:
+        from geopy.geocoders import Bing, Nominatim
+    except ImportError:  # pragma: no cover - dependiente de versión
+        Bing = None  # type: ignore
+        Nominatim = None  # type: ignore
 else:
     geopy = None
     Nominatim = None  # type: ignore
+    Bing = None  # type: ignore
 
 _osmnx_spec = importlib.util.find_spec("osmnx")
 if _osmnx_spec is not None:
@@ -44,13 +51,27 @@ class PropertyExtractor:
 
     def __init__(
         self,
-        google_maps_api_key: Optional[str] = None,
+        google_maps_api_keys: Optional[List[str]] = None,
+        bing_maps_api_keys: Optional[List[str]] = None,
         geopy_user_agent: str = "idealista-geolocator",
     ) -> None:
-        self.google_maps_client = None
-        if googlemaps is not None and google_maps_api_key:
-            self.google_maps_client = googlemaps.Client(key=google_maps_api_key)
+        self.address_normalizer = AddressNormalizer()
         self.geopy_user_agent = geopy_user_agent
+        self.google_api_keys = google_maps_api_keys or settings.google_maps_keys.keys
+        self.bing_api_keys = bing_maps_api_keys or settings.bing_maps_keys.keys
+        self.google_clients = [
+            googlemaps.Client(key=api_key)
+            for api_key in self.google_api_keys
+            if googlemaps is not None and api_key
+        ]
+        self.bing_geocoders = [
+            Bing(api_key=api_key)  # type: ignore[misc]
+            for api_key in self.bing_api_keys
+            if Bing is not None and api_key
+        ]
+        self.catastro_base_url = settings.catastro_base_url
+        self.catastro_token = settings.catastro_token
+        self.http_session = requests.Session()
 
     def parse_properties(self, raw_text: str) -> Tuple[List[PropertyRecord], pd.DataFrame]:
         """Convierte un bloque de texto en registros estructurados.
@@ -177,7 +198,8 @@ class PropertyExtractor:
                     raw_address = match.group(0)
                     break
 
-        return raw_address.strip()
+        normalized = self.address_normalizer.normalize(raw_address.strip())
+        return normalized or raw_address.strip()
 
     def _build_record(self, metadata: Dict[str, str]) -> PropertyRecord:
         """Genera un dataclass PropertyRecord a partir de un diccionario intermedio."""
@@ -241,49 +263,110 @@ class PropertyExtractor:
         if not record.direccion_detectada:
             record.nivel_precision_ubicacion = "baja"
             record.ubicacion_inferida = "No se detectó dirección en el texto original."
+            record.requiere_revision = True
+            record.motivos_revision.append("Sin dirección detectada")
             return record
 
-        address = record.direccion_detectada
-        lat_lon: Optional[Tuple[float, float]] = None
-        fuente = ""
-
-        if self.google_maps_client is not None:
-            geocode_result = self.google_maps_client.geocode(address)
-            if geocode_result:
-                location = geocode_result[0]["geometry"]["location"]
-                lat_lon = (location["lat"], location["lng"])
-                fuente = "Google Maps"
-
-        if lat_lon is None and Nominatim is not None:
-            geolocator = Nominatim(user_agent=self.geopy_user_agent, timeout=10)
-            location = geolocator.geocode(address)
-            if location:
-                lat_lon = (location.latitude, location.longitude)
-                fuente = "OpenStreetMap"
-
-        if lat_lon is None and osmnx is not None:
-            try:
-                geocode = osmnx.geocoder.geocode(address)
-            except Exception:  # noqa: BLE001 - osmnx puede lanzar múltiples excepciones propias
-                geocode = None
-            if geocode:
-                if isinstance(geocode, tuple):
-                    lat_lon = (geocode[0], geocode[1])
-                elif hasattr(geocode, "y") and hasattr(geocode, "x"):
-                    lat_lon = (geocode.y, geocode.x)
-                fuente = "OSMnx"
+        normalized_address = self._normalize_address(record.direccion_detectada)
+        lat_lon, fuente = self._geocode_with_fallbacks(normalized_address, record)
 
         if lat_lon is not None:
             record.latitud, record.longitud = lat_lon
             record.fuente_geolocalizacion = fuente
-            record.nivel_precision_ubicacion = self._assess_precision(address)
-            record.ubicacion_inferida = self._describe_location_inference(address)
+            record.nivel_precision_ubicacion = self.address_normalizer.detect_precision_hint(normalized_address)
+            record.ubicacion_inferida = self._describe_location_inference(normalized_address)
+            if not self._coords_look_confident(record):
+                record.requiere_revision = True
+                record.motivos_revision.append("Coordenadas requieren validación manual")
         else:
             record.nivel_precision_ubicacion = "baja"
             record.ubicacion_inferida = (
                 "No se pudo geocodificar la dirección automáticamente. Revisar manualmente."
             )
+            record.requiere_revision = True
+            record.motivos_revision.append("Geocodificación sin resultado")
         return record
+
+    def _normalize_address(self, detected: str) -> str:
+        cleaned = self.address_normalizer.normalize(detected)
+        return cleaned or detected
+
+    def _geocode_with_fallbacks(
+        self, address: str, record: PropertyRecord
+    ) -> Tuple[Optional[Tuple[float, float]], str]:
+        strategies: List[Tuple[str, Callable[[str], Optional[Tuple[float, float]]]]] = []
+        strategies.extend(("Google Maps", lambda addr, client=client: self._geocode_google(client, addr)) for client in self.google_clients)
+        strategies.extend(("Bing Maps", lambda addr, geocoder=geocoder: self._geocode_geopy(geocoder, addr)) for geocoder in self.bing_geocoders)
+        if Nominatim is not None:
+            strategies.append(("OpenStreetMap", self._geocode_nominatim))
+        if osmnx is not None:
+            strategies.append(("OSMnx", self._geocode_osmnx))
+        if self.catastro_base_url:
+            strategies.append(("Catastro", self._geocode_catastro))
+
+        for source, strategy in strategies:
+            try:
+                result = strategy(address)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("Fallo en geocodificador %s para %s: %s", source, record.id_interno, exc)
+                continue
+            if result:
+                LOGGER.info("Dirección %s resuelta con %s", address, source)
+                return result, source
+        return None, ""
+
+    def _geocode_google(self, client: "googlemaps.Client", address: str) -> Optional[Tuple[float, float]]:
+        geocode_result = client.geocode(address)
+        if not geocode_result:
+            return None
+        location = geocode_result[0]["geometry"]["location"]
+        return (location["lat"], location["lng"])
+
+    def _geocode_geopy(self, geocoder: "geopy.geocoders.base.Geocoder", address: str) -> Optional[Tuple[float, float]]:
+        if geocoder is None:
+            return None
+        location = geocoder.geocode(address, timeout=10)
+        if location:
+            return (location.latitude, location.longitude)
+        return None
+
+    def _geocode_nominatim(self, address: str) -> Optional[Tuple[float, float]]:
+        if Nominatim is None:
+            return None
+        geolocator = Nominatim(user_agent=self.geopy_user_agent, timeout=10)
+        location = geolocator.geocode(address)
+        if location:
+            return (location.latitude, location.longitude)
+        return None
+
+    def _geocode_osmnx(self, address: str) -> Optional[Tuple[float, float]]:
+        try:
+            geocode = osmnx.geocoder.geocode(address)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            geocode = None
+        if geocode:
+            if isinstance(geocode, tuple):
+                return (geocode[0], geocode[1])
+            if hasattr(geocode, "y") and hasattr(geocode, "x"):
+                return (geocode.y, geocode.x)
+        return None
+
+    def _geocode_catastro(self, address: str) -> Optional[Tuple[float, float]]:
+        if not self.catastro_base_url:
+            return None
+        params = {"q": address}
+        if self.catastro_token:
+            params["token"] = self.catastro_token
+        try:
+            response = self.http_session.get(self.catastro_base_url, params=params, timeout=10)
+            response.raise_for_status()
+        except requests.RequestException:
+            return None
+        data = response.json()
+        coords = data.get("coordinates") if isinstance(data, dict) else None
+        if coords and "lat" in coords and "lon" in coords:
+            return (float(coords["lat"]), float(coords["lon"]))
+        return None
 
     def _assess_precision(self, address: str) -> str:
         """Evalúa el nivel de precisión en función del detalle de la dirección."""
@@ -307,6 +390,19 @@ class PropertyExtractor:
         if re.search(r"barrio|zona", address, flags=re.IGNORECASE):
             return "Referencia a barrio o zona, se estimó el centro geográfico del área."
         return "Se utilizó el centro del municipio como aproximación."
+
+    def _coords_look_confident(self, record: PropertyRecord) -> bool:
+        if record.latitud is None or record.longitud is None:
+            return False
+        if not (-90 <= record.latitud <= 90) or not (-180 <= record.longitud <= 180):
+            record.motivos_revision.append("Coordenadas fuera de rango WGS84")
+            return False
+        if abs(record.latitud) < 0.001 and abs(record.longitud) < 0.001:
+            record.motivos_revision.append("Coordenadas cercanas a origen (0,0)")
+            return False
+        if record.nivel_precision_ubicacion == "baja":
+            return False
+        return True
 
     def _parse_float(self, raw_value: Optional[str]) -> Optional[float]:
         if not raw_value:

@@ -9,3 +9,6 @@ simplekml
 openpyxl
 Pillow
 bs4
+folium
+python-dotenv
+openai

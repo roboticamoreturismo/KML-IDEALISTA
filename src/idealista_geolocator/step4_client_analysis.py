@@ -11,12 +11,24 @@ import pandas as pd
 from unidecode import unidecode
 
 from .data_models import ClientProfile
+from .llm_clients import LLMClient, build_llm_from_selection
 
 LOGGER = logging.getLogger(__name__)
 
 
 class ClientAnalyzer:
     """Convierte una transcripción en un perfil estructurado del cliente."""
+
+    def __init__(
+        self,
+        language_model_provider: str = "openai",
+        language_model_name: str = "gpt-4o-mini",
+        language_model_api_key: Optional[str] = None,
+        llm_client: Optional[LLMClient] = None,
+    ) -> None:
+        self.llm_client = llm_client or build_llm_from_selection(
+            language_model_provider, language_model_name, language_model_api_key
+        )
 
     def analyze(self, transcript: str, nombre_cliente: str = "Cliente") -> ClientProfile:
         normalized = unidecode(transcript.lower())
@@ -38,6 +50,7 @@ class ClientAnalyzer:
         profile.presupuesto_max = self._detect_budget(normalized)
         profile.acepta_reformas = self._detect_refurbishment(normalized)
         profile.comentarios_adicionales = transcript.strip()
+        self._llm_enrichment(profile, transcript)
         return profile
 
     def to_dataframe(self, profile: ClientProfile) -> pd.DataFrame:
@@ -146,6 +159,18 @@ class ClientAnalyzer:
         if "no importa reformar" in text or "aceptamos reforma" in text:
             return True
         return None
+
+    def _llm_enrichment(self, profile: ClientProfile, transcript: str) -> None:
+        if not self.llm_client or not self.llm_client.is_ready():
+            return
+        prompt = (
+            "Resume en un párrafo breve las prioridades del cliente para una vivienda "
+            "a partir del siguiente texto. Usa un tono profesional en español.\n\n"
+            f"Transcripción:\n{transcript}"
+        )
+        summary = self.llm_client.complete(prompt)
+        if summary:
+            profile.comentarios_adicionales = summary
 
 
 def profiles_to_dataframe(profiles: Iterable[ClientProfile]) -> pd.DataFrame:

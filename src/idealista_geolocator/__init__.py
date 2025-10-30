@@ -6,7 +6,8 @@ uso en Google Earth y hojas de cálculo. Cada submódulo representa un paso del
 flujo descrito en la documentación del proyecto.
 """
 
-from .data_models import PropertyRecord, ClientProfile, MatchResult
+from .config import settings
+from .data_models import ExportResult, PropertyRecord, ClientProfile, MatchResult
 from .step1_property_extractor import PropertyExtractor
 from .step2_enrichment import PropertyEnricher
 from .step3_environment import EnvironmentAnalyzer
@@ -18,10 +19,12 @@ __all__ = [
     "PropertyRecord",
     "ClientProfile",
     "MatchResult",
+    "ExportResult",
     "PropertyExtractor",
     "PropertyEnricher",
     "EnvironmentAnalyzer",
     "ClientAnalyzer",
     "MatchingEngine",
     "Exporter",
+    "settings",
 ]

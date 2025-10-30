@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import importlib
 import logging
-from typing import Dict, Iterable, List, Optional, Tuple
+from itertools import cycle
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 from geopy.distance import geodesic
 
 from .data_models import PropertyRecord
+from .config import settings
 
 LOGGER = logging.getLogger(__name__)
 
@@ -47,12 +49,16 @@ class EnvironmentAnalyzer:
 
     def __init__(
         self,
-        google_maps_api_key: Optional[str] = None,
+        google_maps_api_keys: Optional[List[str]] = None,
         geopy_user_agent: str = "idealista-geolocator",
     ) -> None:
-        self.google_maps_client = None
-        if googlemaps is not None and google_maps_api_key:
-            self.google_maps_client = googlemaps.Client(key=google_maps_api_key)
+        keys = google_maps_api_keys or settings.google_maps_keys.keys
+        self.google_clients = [
+            googlemaps.Client(key=api_key)
+            for api_key in keys
+            if googlemaps is not None and api_key
+        ]
+        self.google_client_cycle: Iterator["googlemaps.Client"] = cycle(self.google_clients) if self.google_clients else iter(())
         self.geopy_user_agent = geopy_user_agent
 
     def analyze(self, records: Iterable[PropertyRecord]) -> List[PropertyRecord]:
@@ -75,13 +81,18 @@ class EnvironmentAnalyzer:
 
     def _collect_services(self, location: Tuple[float, float], radius: int) -> Dict[str, List[Dict[str, str]]]:
         services: Dict[str, List[Dict[str, str]]] = {category: [] for category in CATEGORIES}
-        if self.google_maps_client is not None:
+        if self.google_clients:
             for category, types in CATEGORIES.items():
                 aggregated: List[Dict[str, str]] = []
                 for place_type in types:
-                    results = self.google_maps_client.places_nearby(
-                        location=location, radius=radius, type=place_type
-                    )
+                    client = self._next_google_client()
+                    if client is None:
+                        break
+                    try:
+                        results = client.places_nearby(location=location, radius=radius, type=place_type)
+                    except Exception as exc:  # noqa: BLE001
+                        LOGGER.warning("Google Places error (%s) buscando %s: %s", radius, place_type, exc)
+                        continue
                     for result in results.get("results", []):
                         aggregated.append(
                             {
@@ -111,6 +122,12 @@ class EnvironmentAnalyzer:
                         for _, row in gdf.iterrows()
                     ]
         return services
+
+    def _next_google_client(self) -> Optional["googlemaps.Client"]:
+        try:
+            return next(self.google_client_cycle)
+        except StopIteration:
+            return None
 
     def _summarize_services(self, raw_services: Dict[int, Dict[str, List[Dict[str, str]]]]) -> Dict[str, List[Dict[str, str]]]:
         summary: Dict[str, List[Dict[str, str]]] = {category: [] for category in CATEGORIES}

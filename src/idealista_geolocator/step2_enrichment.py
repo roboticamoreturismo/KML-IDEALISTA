@@ -14,6 +14,7 @@ import requests
 from unidecode import unidecode
 
 from .data_models import PropertyRecord
+from .llm_clients import LLMClient, build_llm_from_selection
 
 LOGGER = logging.getLogger(__name__)
 
@@ -35,8 +36,16 @@ else:
 class PropertyEnricher:
     """Amplía la información disponible de una propiedad."""
 
-    def __init__(self, openai_api_key: Optional[str] = None) -> None:
-        self.openai_api_key = openai_api_key
+    def __init__(
+        self,
+        language_model_provider: str = "openai",
+        language_model_name: str = "gpt-4o-mini",
+        language_model_api_key: Optional[str] = None,
+        llm_client: Optional[LLMClient] = None,
+    ) -> None:
+        self.llm_client = llm_client or build_llm_from_selection(
+            language_model_provider, language_model_name, language_model_api_key
+        )
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -59,6 +68,7 @@ class PropertyEnricher:
             self._parse_listing_page(record, page_content)
         self._enhance_from_description(record)
         self._analyse_images(record)
+        self._llm_enrichment(record)
         return record
 
     def _fetch_listing_page(self, url: str) -> Optional[str]:
@@ -138,6 +148,20 @@ class PropertyEnricher:
 
         if not record.estado_general:
             record.estado_general = self._detect_condition(normalized)
+
+    def _llm_enrichment(self, record: PropertyRecord) -> None:
+        if not self.llm_client or not self.llm_client.is_ready():
+            return
+        prompt = (
+            "Eres un asistente inmobiliario. Resume en viñetas breves las "
+            "características diferenciales del siguiente anuncio.\n"
+            "Descripción:\n"
+            f"{record.descripcion_limpia}\n"
+            "Devuelve 3 viñetas concisas en español."
+        )
+        summary = self.llm_client.complete(prompt)
+        if summary:
+            record.caracteristicas_extra["resumen_llm"] = summary
 
     def _analyse_images(self, record: PropertyRecord) -> None:
         if not record.imagenes:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 
 
@@ -50,6 +51,8 @@ class PropertyRecord:
     afinidad_porcentaje: Optional[float] = None
     justificacion_afinidad: str = ""
     propuestas_mejora: List[str] = field(default_factory=list)
+    requiere_revision: bool = False
+    motivos_revision: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -86,3 +89,13 @@ class MatchResult:
     discrepancias: Dict[str, str]
     justificacion: str
     propuestas_mejora: List[str]
+
+
+@dataclass
+class ExportResult:
+    """Resultado de la exportación de ficheros del paso 6."""
+
+    carpeta: Path
+    excel_path: Path
+    resumen_json_path: Path
+    kml_path: Optional[Path] = None
