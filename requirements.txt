@@ -1,0 +1,14 @@
+pandas
+streamlit
+requests
+unidecode
+geopy
+googlemaps
+osmnx
+simplekml
+openpyxl
+Pillow
+bs4
+folium
+python-dotenv
+openai
