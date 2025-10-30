@@ -28,6 +28,38 @@ from idealista_geolocator.config import settings
 from idealista_geolocator.llm_clients import build_llm_from_selection
 from idealista_geolocator.service_endpoints import load_file_bytes
 
+def _build_map_component(records):
+    """Construye el componente HTML del mapa con los registros geolocalizados."""
+
+    points = [
+        (record.latitud, record.longitud, record)
+        for record in records
+        if record.latitud is not None and record.longitud is not None
+    ]
+    if not points:
+        return ""
+
+    avg_lat = sum(lat for lat, _, _ in points) / len(points)
+    avg_lon = sum(lon for _, lon, _ in points) / len(points)
+    fmap = folium.Map(location=[avg_lat, avg_lon], zoom_start=13, tiles="CartoDB positron")
+
+    for lat, lon, record in points:
+        color = "#2E7D32" if (record.precio_total or 0) < 150000 else "#1B5E20"
+        if record.requiere_revision:
+            color = "#D32F2F"
+
+        folium.CircleMarker(
+            location=(lat, lon),
+            radius=8,
+            color=color,
+            fill=True,
+            fill_color=color,
+            popup=f"{record.titulo[:40]}... | Afinidad: {record.afinidad_porcentaje or 'N/D'}%",
+        ).add_to(fmap)
+
+    return fmap._repr_html_()
+
+
 st.set_page_config(page_title="Geolocalizador Idealista", layout="wide")
 
 st.title("Geolocalizador Idealista para Google Earth")
@@ -177,29 +209,3 @@ if process_button:
         )
 
     st.info(f"Archivos guardados en {export_result.carpeta}")
-
-
-def _build_map_component(records):
-    points = [
-        (record.latitud, record.longitud, record)
-        for record in records
-        if record.latitud is not None and record.longitud is not None
-    ]
-    if not points:
-        return ""
-    avg_lat = sum(lat for lat, _, _ in points) / len(points)
-    avg_lon = sum(lon for _, lon, _ in points) / len(points)
-    fmap = folium.Map(location=[avg_lat, avg_lon], zoom_start=13, tiles="CartoDB positron")
-    for lat, lon, record in points:
-        color = "#2E7D32" if (record.precio_total or 0) < 150000 else "#1B5E20"
-        if record.requiere_revision:
-            color = "#D32F2F"
-        folium.CircleMarker(
-            location=(lat, lon),
-            radius=8,
-            color=color,
-            fill=True,
-            fill_color=color,
-            popup=f"{record.titulo[:40]}... | Afinidad: {record.afinidad_porcentaje or 'N/D'}%",
-        ).add_to(fmap)
-    return fmap._repr_html_()
